@@ -1,0 +1,799 @@
+---
+title: "Phylogenetic Signal and Ancestral State Reconstruction"
+author: "Rene Huerta"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+# Overview
+
+This file demonstrates the workflow I use to analyze binary and multistate traits across a phylogeny. It follows the same general methods I used in my
+evolutionary research, including checking the data, removing duplicates, matching trait data to a phylogenetic tree, pruning unmatched species, calculating Fritz and Purvis's D, fitting an all-rates-different transition model, and reconstructing ancestral states with `corHMM`.
+
+To keep this example public and reproducible, it uses the `BritishBirds` dataset included in the `caper` package over any unpublished research data or results.
+
+# Load packages
+
+```{r load-packages}
+library(geiger)
+library(nlme)
+library(phytools)
+library(corHMM)
+library(caper)
+library(picante)
+library(ape)
+library(dplyr)
+library(knitr)
+```
+
+# Load the public data and phylogenetic tree
+
+```{r load-data}
+data("BritishBirds", package = "caper")
+
+birdData <- BritishBirds.data
+birdPhy <- BritishBirds.tree
+```
+
+```{r inspect-data}
+cat("Rows in the original trait dataset:", nrow(birdData), "\n")
+cat("Columns in the original trait dataset:", ncol(birdData), "\n")
+cat("Tips in the original phylogeny:", length(birdPhy$tip.label), "\n")
+
+head(
+  birdData[, c(
+    "binomial",
+    "common_name",
+    "Red_list",
+    "Amber_list",
+    "Green_list"
+  )]
+)
+```
+
+# Select the species and binary-trait columns
+
+In my original workflow, I selected a defined range of morphology columns. For this public example, I keep the species identifier and three binary conservation-status traits.
+
+```{r select-columns}
+traitColumns <- c(
+  "binomial",
+  "Red_list",
+  "Amber_list",
+  "Green_list"
+)
+
+birdBinaryData <- birdData[, traitColumns]
+```
+
+# Remove empty species rows
+
+The original dataset I worked with contained extra empty rows at the end of the CSV file. This dataset does not normally include those rows, but I keep the same check so the workflow can handle them if they appear.
+
+```{r remove-empty-rows}
+validSpeciesRows <- !is.na(birdBinaryData$binomial) &
+  trimws(birdBinaryData$binomial) != ""
+
+birdBinaryData <- birdBinaryData[validSpeciesRows, ]
+```
+
+# Check for duplicate rows
+
+```{r check-duplicate-rows}
+birdDuplicates <- birdBinaryData[
+  duplicated(birdBinaryData) |
+    duplicated(birdBinaryData, fromLast = TRUE),
+]
+
+birdDuplicates
+```
+
+# Remove node labels
+
+```{r remove-node-labels}
+birdPhy$node.label <- NULL
+```
+
+# Remove duplicate species
+
+```{r remove-duplicate-species}
+birdBinaryDataNoDup <- birdBinaryData[
+  !duplicated(birdBinaryData$binomial),
+]
+```
+
+# Set row names to species names
+
+`match.phylo.data()` matches tree tips to the row names of the trait dataset, so I set the row names using each species' binomial name.
+
+```{r set-row-names}
+rownames(birdBinaryDataNoDup) <- birdBinaryDataNoDup$binomial
+```
+
+# Remove missing observations
+
+As in my original workflow, I use `na.omit()` before matching the data and tree so every retained species has values for all selected traits.
+
+```{r remove-missing-values}
+birdBinaryDataNoDup <- na.omit(birdBinaryDataNoDup)
+```
+
+# Match the phylogeny and trait data
+
+```{r match-phylogeny-data}
+invisible(
+  capture.output({
+    birdMatchedData <- match.phylo.data(
+      birdPhy,
+      birdBinaryDataNoDup
+    )
+  })
+)
+
+birdPrunedPhy <- birdMatchedData$phy
+birdPrunedBinaryData <- birdMatchedData$data
+```
+
+# Convert binary traits to integers
+
+```{r convert-traits}
+birdPrunedBinaryData <- birdPrunedBinaryData %>%
+  mutate(
+    across(
+      -binomial,
+      as.integer
+    )
+  )
+```
+
+# Check the matched phylogeny
+
+```{r check-tip-labels}
+if (any(duplicated(birdPrunedPhy$tip.label))) {
+  stop("Duplicate tip labels found in the phylogeny.")
+}
+```
+
+```{r check-node-labels}
+if (!is.null(birdPrunedPhy$node.label)) {
+  birdPrunedPhy$node.label <- make.unique(
+    as.character(birdPrunedPhy$node.label)
+  )
+}
+```
+
+# Create the comparative data object
+
+```{r create-comparative-data}
+birdComparativeData <- comparative.data(
+  phy = birdPrunedPhy,
+  data = birdPrunedBinaryData,
+  names.col = "binomial",
+  vcv = FALSE,
+  na.omit = FALSE,
+  warn.dropped = TRUE
+)
+
+print(birdComparativeData)
+```
+
+# Plot the pruned phylogeny
+
+```{r plot-pruned-tree, fig.width=9, fig.height=12}
+plot(
+  birdPrunedPhy,
+  cex = 0.35,
+  no.margin = TRUE,
+  main = "Pruned British Bird Phylogeny"
+)
+```
+
+# Calculate phylogenetic signal
+
+Fritz and Purvis's D compares the observed distribution of a binary trait
+with two reference patterns:
+
+- A D value near 1 is consistent with a random distribution across the tree.
+- A D value near 0 is consistent with clustering under a Brownian threshold
+  model.
+- Values below 0 suggest stronger clustering.
+- Values above 1 suggest greater overdispersion.
+
+The `phylo.d()` function expects an unquoted column name. Because the trait names are stored as text inside `traitList`, I build and evaluate the call inside the function.
+
+```{r phylo-d-function}
+calculatePhyloD <- function(
+  traitName,
+  comparativeData,
+  permutations = 1000
+) {
+
+  if (!traitName %in% names(comparativeData$data)) {
+    stop(
+      paste0(
+        "'", traitName,
+        "' is not present in the comparative dataset."
+      )
+    )
+  }
+
+  phyloDCall <- substitute(
+    phylo.d(
+      data = comparativeData,
+      binvar = traitVariable,
+      permut = permutationCount
+    ),
+    list(
+      traitVariable = as.name(traitName),
+      permutationCount = permutations
+    )
+  )
+
+  phyloDResult <- eval(phyloDCall)
+
+  data.frame(
+    trait = traitName,
+    dEstimate = phyloDResult$DEstimate,
+    pDifferentFromRandom = phyloDResult$Pval1,
+    pDifferentFromBrownian = phyloDResult$Pval0
+  )
+}
+```
+
+# Run phylogenetic-signal analysis for all binary traits
+
+```{r calculate-all-traits}
+set.seed(1)
+
+traitList <- c(
+  "Red_list",
+  "Amber_list",
+  "Green_list"
+)
+
+phyloDResultsList <- lapply(
+  traitList,
+  calculatePhyloD,
+  comparativeData = birdComparativeData,
+  permutations = 1000
+)
+
+phyloDResults <- bind_rows(phyloDResultsList)
+
+kable(
+  phyloDResults,
+  digits = 4,
+  caption = "Phylogenetic signal across binary conservation traits"
+)
+```
+
+# Save individual D-statistic results
+
+The trait names are unquoted here because that is the format expected by
+`phylo.d()`.
+
+```{r individual-d-results}
+set.seed(1)
+
+redListPhyloD <- phylo.d(
+  birdComparativeData,
+  binvar = Red_list,
+  permut = 1000
+)
+
+amberListPhyloD <- phylo.d(
+  birdComparativeData,
+  binvar = Amber_list,
+  permut = 1000
+)
+
+greenListPhyloD <- phylo.d(
+  birdComparativeData,
+  binvar = Green_list,
+  permut = 1000
+)
+
+print(redListPhyloD)
+print(amberListPhyloD)
+print(greenListPhyloD)
+```
+
+# Combine the D estimates into a matrix
+
+```{r combine-d-results}
+combinedPhyloD <- c(
+  redListPhyloD$DEstimate,
+  amberListPhyloD$DEstimate,
+  greenListPhyloD$DEstimate
+)
+
+phyloDMatrix <- matrix(
+  combinedPhyloD,
+  nrow = 1,
+  byrow = TRUE,
+  dimnames = list(
+    "D estimate",
+    c("Red list", "Amber list", "Green list")
+  )
+)
+
+print(phyloDMatrix)
+```
+
+# Create a multistate conservation-status trait
+
+The three conservation columns are binary indicators, but ancestral-state reconstruction is more useful here if they are represented as one monomorphic trait. Each species is needed to be assigned to `Red`, `Amber`, or `Green`.
+
+```{r create-conservation-state}
+statusCount <- rowSums(
+  birdPrunedBinaryData[, c(
+    "Red_list",
+    "Amber_list",
+    "Green_list"
+  )]
+)
+
+if (any(statusCount != 1)) {
+  stop()
+}
+
+birdPrunedBinaryData$conservationState <- case_when(
+  birdPrunedBinaryData$Red_list == 1 ~ "Red",
+  birdPrunedBinaryData$Amber_list == 1 ~ "Amber",
+  birdPrunedBinaryData$Green_list == 1 ~ "Green",
+  TRUE ~ NA_character_
+)
+
+table(birdPrunedBinaryData$conservationState)
+```
+
+# Fit an all-rates-different transition model
+
+I fit four alternative models of discrete-trait evolution:
+
+- **ER:** all transitions share one rate.
+- **SYM:** forward and reverse transitions between each pair of states share
+  the same rate.
+- **ARD:** every directional transition can have its own rate.
+
+```{r fit-ard-model2}
+prunedConservationState <- setNames(
+  birdPrunedBinaryData$conservationState,
+  birdPrunedBinaryData$binomial
+)
+
+# Reorder the trait vector so it follows the same order as the tree tips.
+prunedConservationState <- prunedConservationState[
+  birdPrunedPhy$tip.label
+]
+
+# Check which states are represented after pruning.
+table(prunedConservationState)
+```
+
+## Equal-rates model
+
+```{r fit-er-model}
+fitMkConservationER <- fitMk(
+  tree = birdPrunedPhy,
+  x = prunedConservationState,
+  model = "ER",
+  pi = "estimated"
+)
+
+print(fitMkConservationER)
+```
+
+## Symmetric-rates model
+
+```{r fit-sym-model}
+fitMkConservationSYM <- fitMk(
+  tree = birdPrunedPhy,
+  x = prunedConservationState,
+  model = "SYM",
+  pi = "estimated"
+)
+
+print(fitMkConservationSYM)
+```
+
+## All-rates-different model
+
+```{r fit-ard-model}
+fitMkConservationARD <- fitMk(
+  tree = birdPrunedPhy,
+  x = prunedConservationState,
+  model = "ARD",
+  pi = "estimated"
+)
+
+print(fitMkConservationARD)
+```
+
+# Compare model support
+
+I compare the models using AIC and sample-size-corrected AIC, or AICc. The model with the lowest value has the strongest relative support among the models compared.
+
+```{r compare-transition-models}
+extractModelMetrics <- function(
+  fittedModel,
+  modelName,
+  sampleSize
+) {
+
+  if (is.null(fittedModel)) {
+    return(
+      data.frame(
+        model = modelName,
+        logLikelihood = NA_real_,
+        parameterCount = NA_integer_,
+        aic = NA_real_,
+        aicc = NA_real_
+      )
+    )
+  }
+
+  logLikelihood <- as.numeric(logLik(fittedModel))
+  parameterCount <- attr(logLik(fittedModel), "df")
+
+  modelAIC <- AIC(fittedModel)
+
+  modelAICc <- modelAIC +
+    (
+      2 * parameterCount * (parameterCount + 1)
+    ) /
+    (
+      sampleSize - parameterCount - 1
+    )
+
+  data.frame(
+    model = modelName,
+    logLikelihood = logLikelihood,
+    parameterCount = parameterCount,
+    aic = modelAIC,
+    aicc = modelAICc
+  )
+}
+
+sampleSize <- length(prunedConservationState)
+
+transitionModelResults <- bind_rows(
+  extractModelMetrics(
+    fitMkConservationER,
+    "ER",
+    sampleSize
+  ),
+  extractModelMetrics(
+    fitMkConservationSYM,
+    "SYM",
+    sampleSize
+  ),
+  extractModelMetrics(
+    fitMkConservationARD,
+    "ARD",
+    sampleSize
+  )
+)
+
+transitionModelResults <- transitionModelResults %>%
+  filter(!is.na(aicc)) %>%
+  arrange(aicc) %>%
+  mutate(
+    deltaAIC = aic - min(aic),
+    deltaAICc = aicc - min(aicc),
+    aiccWeight = exp(-0.5 * deltaAICc) /
+      sum(exp(-0.5 * deltaAICc))
+  )
+
+kable(
+  transitionModelResults,
+  digits = 4,
+  caption = "Comparison of discrete-trait transition models"
+)
+```
+
+# Select the best-supported model
+
+```{r select-best-model}
+bestModelName <- transitionModelResults$model[1]
+
+bestTransitionModel <- switch(
+  bestModelName,
+  "ER" = fitMkConservationER,
+  "SYM" = fitMkConservationSYM,
+  "ARD" = fitMkConservationARD
+)
+
+cat(
+  "Best-supported model based on AICc:",
+  bestModelName,
+  "\n"
+)
+
+print(bestTransitionModel)
+```
+
+# Plot all fitted models
+
+```{r plot-er-model}
+plot(
+  fitMkConservationER,
+  main = "Equal-Rates Model"
+)
+```
+
+```{r plot-sym-model}
+plot(
+  fitMkConservationSYM,
+  main = "Symmetric-Rates Model"
+)
+```
+
+```{r plot-ard-model}
+plot(
+  fitMkConservationARD,
+  main = "All-Rates-Different Model"
+)
+```
+
+# Format the state data for corHMM
+
+This follows the same method I used in my original ancestral-state file. The state vector is converted into a two-column data frame with species names in the first column and the observed state in the second.
+
+```{r format-corhmm-data}
+conservationStateVector <- setNames(
+  as.character(prunedConservationState),
+  names(prunedConservationState)
+)
+
+# corHMM uses "/" to separate polymorphic states.
+conservationStateVector <- gsub(
+  "+",
+  "/",
+  conservationStateVector,
+  fixed = TRUE
+)
+
+# gsub() can also remove names, so assign them again.
+names(conservationStateVector) <- names(prunedConservationState)
+
+conservationData <- data.frame(
+  species = names(conservationStateVector),
+  conservationState = unname(conservationStateVector),
+  stringsAsFactors = FALSE
+)
+
+head(conservationData)
+nrow(conservationData)
+```
+
+# Prepare the transition-rate matrix
+
+The index matrix from the fitted ARD model identifies which transition-rate parameter belongs to each directional change. As in my original workflow, zeros are replaced by `NA`, state names are formatted for `corHMM`, and the matrix is reordered alphabetically.
+
+```{r prepare-rate-matrix}
+# Use the best-supported ER, SYM, or ARD model.
+rateMat <- bestTransitionModel$index.matrix
+
+# Get the observed state names in the same alphabetical order used by fitMk().
+modelStates <- sort(
+  unique(
+    as.character(prunedConservationState)
+  )
+)
+
+# Confirm that the number of states matches the matrix dimensions.
+if (
+  length(modelStates) != nrow(rateMat) ||
+  length(modelStates) != ncol(rateMat)
+) {
+  stop(
+    paste0(
+      "The number of observed states does not match the dimensions ",
+      "of the transition-rate matrix."
+    )
+  )
+}
+
+# fitMk() may return an index matrix without dimension names,
+# so add the state names before formatting it for corHMM.
+dimnames(rateMat) <- list(
+  modelStates,
+  modelStates
+)
+
+# corHMM uses NA on the diagonal of a custom index matrix.
+rateMat[rateMat == 0] <- NA
+
+# corHMM uses "/" for polymorphic state labels.
+rownames(rateMat) <- gsub(
+  "+",
+  "/",
+  rownames(rateMat),
+  fixed = TRUE
+)
+
+colnames(rateMat) <- gsub(
+  "+",
+  "/",
+  colnames(rateMat),
+  fixed = TRUE
+)
+
+rateMat
+```
+
+# Run marginal ancestral-state reconstruction with corHMM
+
+The fitted transition rates from `fitMk()` are passed into `corHMM`, along
+with the custom ARD rate matrix. Marginal reconstruction returns the
+probability of each state at every internal node while integrating over the
+states at the other nodes.
+
+```{r run-corhmm-asr}
+fitMarginal <- corHMM(
+  phy = birdPrunedPhy,
+  data = conservationData,
+  rate.mat = rateMat,
+  node.states = "marginal",
+  rate.cat = 1,
+  p = fitMkConservationARD$rates,
+  root.p = fitMkConservationARD$pi
+)
+
+asr <- fitMarginal$states
+
+colnames(asr) <- colnames(rateMat)
+colnames(asr) <- gsub(
+  "/",
+  "+",
+  colnames(asr),
+  fixed = TRUE
+)
+
+head(asr)
+```
+
+# Plot the phylogeny with ancestral-state probabilities
+
+The tip states are plotted as single-color pie charts. The internal nodes are
+plotted using the marginal state probabilities returned by `corHMM`.
+
+```{r plot-asr, fig.width=12, fig.height=12}
+plotTree(
+  birdPrunedPhy,
+  ftype = "off",
+  lwd = 1,
+  type = "fan"
+)
+
+tipStateList <- strsplit(
+  setNames(
+    as.character(prunedConservationState),
+    names(prunedConservationState)
+  ),
+  "+",
+  fixed = TRUE
+)
+
+stateNames <- c(
+  "Amber",
+  "Green",
+  "Red"
+)
+
+tipPies <- matrix(
+  0,
+  Ntip(birdPrunedPhy),
+  length(stateNames),
+  dimnames = list(
+    birdPrunedPhy$tip.label,
+    stateNames
+  )
+)
+
+for (tipIndex in seq_len(Ntip(birdPrunedPhy))) {
+
+  tipName <- birdPrunedPhy$tip.label[tipIndex]
+  observedStates <- tipStateList[[tipName]]
+
+  tipPies[
+    tipName,
+    observedStates
+  ] <- rep(
+    1 / length(observedStates),
+    length(observedStates)
+  )
+}
+
+stateColors <- setNames(
+  c("gold1", "olivedrab3", "firebrick3"),
+  stateNames
+)
+
+par(fg = "transparent")
+
+tiplabels(
+  pie = tipPies,
+  piecol = stateColors,
+  cex = 0.28
+)
+
+par(fg = "black")
+
+pieColors <- vector(
+  mode = "character",
+  length = ncol(asr)
+)
+
+for (stateIndex in seq_len(ncol(asr))) {
+
+  reconstructedStates <- strsplit(
+    colnames(asr)[stateIndex],
+    "+",
+    fixed = TRUE
+  )[[1]]
+
+  if (length(reconstructedStates) == 1) {
+
+    pieColors[stateIndex] <- stateColors[reconstructedStates]
+
+  } else if (length(reconstructedStates) == 2) {
+
+    pieColors[stateIndex] <- colorRampPalette(
+      stateColors[reconstructedStates]
+    )(3)[2]
+
+  } else {
+
+    pieColors[stateIndex] <- "black"
+  }
+}
+
+names(pieColors) <- colnames(asr)
+
+par(fg = "transparent")
+
+nodelabels(
+  pie = asr,
+  piecol = pieColors,
+  cex = 0.35
+)
+
+par(fg = "black")
+
+legend(
+  x = "topleft",
+  legend = colnames(asr),
+  pt.cex = 1.8,
+  pch = 16,
+  cex = 0.8,
+  col = pieColors,
+  bty = "n"
+)
+```
+
+# Interpretation
+
+The node pie charts represent the marginal probabilities of the reconstructed conservation states. A node dominated by one color has stronger support for that state, while a node divided among colors has greater uncertainty.
+
+The reconstruction should be interpreted as a model-based estimate rather than a direct observation of historical conservation status. Present-day conservation categories are defined using recent population and range trends, so this analysis is primarily a demonstration of the ancestral-state workflow rather than a literal biological claim about ancient threat categories.
+
+# Reproducibility
+
+```{r session-info, include=FALSE}
+sessionInfo()
+```
